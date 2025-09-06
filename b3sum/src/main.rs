@@ -1,7 +1,6 @@
-use anyhow::{bail, ensure, Context, Result};
-use clap::{App, Arg};
+use anyhow::{bail, ensure};
+use clap::Parser;
 use std::cmp;
-use std::convert::TryInto;
 use std::fs::File;
 use std::io;
 use std::io::prelude::*;
@@ -12,124 +11,116 @@ mod unit_tests;
 
 const NAME: &str = "b3sum";
 
-const FILE_ARG: &str = "FILE";
-const DERIVE_KEY_ARG: &str = "derive-key";
+const DERIVE_KEY_ARG: &str = "derive_key";
 const KEYED_ARG: &str = "keyed";
 const LENGTH_ARG: &str = "length";
-const NO_MMAP_ARG: &str = "no-mmap";
-const NO_NAMES_ARG: &str = "no-names";
-const NUM_THREADS_ARG: &str = "num-threads";
+const NO_NAMES_ARG: &str = "no_names";
 const RAW_ARG: &str = "raw";
+const TAG_ARG: &str = "tag";
 const CHECK_ARG: &str = "check";
-const QUIET_ARG: &str = "quiet";
+
+#[derive(Parser)]
+#[command(version, max_term_width(100))]
+struct Inner {
+    /// Files to hash, or checkfiles to check
+    ///
+    /// When no file is given, or when - is given, read standard input.
+    file: Vec<PathBuf>,
+
+    /// Use the keyed mode, reading the 32-byte key from stdin
+    #[arg(long, requires("file"))]
+    keyed: bool,
+
+    /// Use the key derivation mode, with the given context string
+    ///
+    /// Cannot be used with --keyed.
+    #[arg(long, value_name("CONTEXT"), conflicts_with(KEYED_ARG))]
+    derive_key: Option<String>,
+
+    /// The number of output bytes, before hex encoding
+    #[arg(
+        short,
+        long,
+        default_value_t = blake3::OUT_LEN as u64,
+        value_name("LEN")
+    )]
+    length: u64,
+
+    /// The starting output byte offset, before hex encoding
+    #[arg(long, default_value_t = 0, value_name("SEEK"))]
+    seek: u64,
+
+    /// The maximum number of threads to use
+    ///
+    /// By default, this is the number of logical cores. If this flag is
+    /// omitted, or if its value is 0, RAYON_NUM_THREADS is also respected.
+    #[arg(long, value_name("NUM"))]
+    num_threads: Option<usize>,
+
+    /// Disable memory mapping
+    ///
+    /// Currently this also disables multithreading.
+    #[arg(long)]
+    no_mmap: bool,
+
+    /// Omit filenames in the output
+    #[arg(long)]
+    no_names: bool,
+
+    /// Write raw output bytes to stdout, rather than hex
+    ///
+    /// --no-names is implied. In this case, only a single input is allowed.
+    #[arg(long)]
+    raw: bool,
+
+    /// Output BSD-style checksums: BLAKE3 ([FILE]) = [HASH]
+    #[arg(long)]
+    tag: bool,
+
+    /// Read BLAKE3 sums from the [FILE]s and check them
+    #[arg(
+        short,
+        long,
+        conflicts_with(DERIVE_KEY_ARG),
+        conflicts_with(KEYED_ARG),
+        conflicts_with(LENGTH_ARG),
+        conflicts_with(RAW_ARG),
+        conflicts_with(TAG_ARG),
+        conflicts_with(NO_NAMES_ARG)
+    )]
+    check: bool,
+
+    /// Skip printing OK for each checked file
+    ///
+    /// Must be used with --check.
+    #[arg(long, requires(CHECK_ARG))]
+    quiet: bool,
+}
 
 struct Args {
-    inner: clap::ArgMatches,
+    inner: Inner,
     file_args: Vec<PathBuf>,
     base_hasher: blake3::Hasher,
 }
 
 impl Args {
-    fn parse() -> Result<Self> {
-        let inner = App::new(NAME)
-            .version(env!("CARGO_PKG_VERSION"))
-            .arg(
-                Arg::new(FILE_ARG)
-                    .multiple_occurrences(true)
-                    .allow_invalid_utf8(true)
-                    .help(
-                        "Files to hash, or checkfiles to check. When no file is given,\n\
-                 or when - is given, read standard input.",
-                    ),
-            )
-            .arg(
-                Arg::new(LENGTH_ARG)
-                    .long(LENGTH_ARG)
-                    .short('l')
-                    .takes_value(true)
-                    .value_name("LEN")
-                    .help(
-                        "The number of output bytes, prior to hex\n\
-                         encoding (default 32)",
-                    ),
-            )
-            .arg(
-                Arg::new(NUM_THREADS_ARG)
-                    .long(NUM_THREADS_ARG)
-                    .takes_value(true)
-                    .value_name("NUM")
-                    .help(
-                        "The maximum number of threads to use. By\n\
-                         default, this is the number of logical cores.\n\
-                         If this flag is omitted, or if its value is 0,\n\
-                         RAYON_NUM_THREADS is also respected.",
-                    ),
-            )
-            .arg(Arg::new(KEYED_ARG).long(KEYED_ARG).requires(FILE_ARG).help(
-                "Uses the keyed mode. The secret key is read from standard\n\
-                         input, and it must be exactly 32 raw bytes.",
-            ))
-            .arg(
-                Arg::new(DERIVE_KEY_ARG)
-                    .long(DERIVE_KEY_ARG)
-                    .conflicts_with(KEYED_ARG)
-                    .takes_value(true)
-                    .value_name("CONTEXT")
-                    .help(
-                        "Uses the key derivation mode, with the given\n\
-                         context string. Cannot be used with --keyed.",
-                    ),
-            )
-            .arg(Arg::new(NO_MMAP_ARG).long(NO_MMAP_ARG).help(
-                "Disables memory mapping. Currently this also disables\n\
-                 multithreading.",
-            ))
-            .arg(
-                Arg::new(NO_NAMES_ARG)
-                    .long(NO_NAMES_ARG)
-                    .help("Omits filenames in the output"),
-            )
-            .arg(Arg::new(RAW_ARG).long(RAW_ARG).help(
-                "Writes raw output bytes to stdout, rather than hex.\n\
-                 --no-names is implied. In this case, only a single\n\
-                 input is allowed.",
-            ))
-            .arg(
-                Arg::new(CHECK_ARG)
-                    .long(CHECK_ARG)
-                    .short('c')
-                    .conflicts_with(DERIVE_KEY_ARG)
-                    .conflicts_with(KEYED_ARG)
-                    .conflicts_with(LENGTH_ARG)
-                    .conflicts_with(RAW_ARG)
-                    .conflicts_with(NO_NAMES_ARG)
-                    .help("Reads BLAKE3 sums from the [FILE]s and checks them"),
-            )
-            .arg(
-                Arg::new(QUIET_ARG)
-                    .long(QUIET_ARG)
-                    .requires(CHECK_ARG)
-                    .help(
-                        "Skips printing OK for each successfully verified file.\n\
-                         Must be used with --check.",
-                    ),
-            )
-            // wild::args_os() is equivalent to std::env::args_os() on Unix,
-            // but on Windows it adds support for globbing.
-            .get_matches_from(wild::args_os());
-        let file_args = if let Some(iter) = inner.values_of_os(FILE_ARG) {
-            iter.map(|s| s.into()).collect()
+    fn parse() -> anyhow::Result<Self> {
+        // wild::args_os() is equivalent to std::env::args_os() on Unix,
+        // but on Windows it adds support for globbing.
+        let inner = Inner::parse_from(wild::args_os());
+        let file_args = if !inner.file.is_empty() {
+            inner.file.clone()
         } else {
             vec!["-".into()]
         };
-        if inner.is_present(RAW_ARG) && file_args.len() > 1 {
+        if inner.raw && file_args.len() > 1 {
             bail!("Only one filename can be provided when using --raw");
         }
-        let base_hasher = if inner.is_present(KEYED_ARG) {
+        let base_hasher = if inner.keyed {
             // In keyed mode, since stdin is used for the key, we can't handle
             // `-` arguments. Input::open handles that case below.
             blake3::Hasher::new_keyed(&read_key_from_stdin()?)
-        } else if let Some(context) = inner.value_of(DERIVE_KEY_ARG) {
+        } else if let Some(ref context) = inner.derive_key {
             blake3::Hasher::new_derive_key(context)
         } else {
             blake3::Hasher::new()
@@ -141,174 +132,71 @@ impl Args {
         })
     }
 
-    fn num_threads(&self) -> Result<Option<usize>> {
-        if let Some(num_threads_str) = self.inner.value_of(NUM_THREADS_ARG) {
-            Ok(Some(
-                num_threads_str
-                    .parse()
-                    .context("Failed to parse num threads.")?,
-            ))
-        } else {
-            Ok(None)
-        }
+    fn num_threads(&self) -> Option<usize> {
+        self.inner.num_threads
     }
 
     fn check(&self) -> bool {
-        self.inner.is_present(CHECK_ARG)
+        self.inner.check
     }
 
     fn raw(&self) -> bool {
-        self.inner.is_present(RAW_ARG)
+        self.inner.raw
+    }
+
+    fn tag(&self) -> bool {
+        self.inner.tag
     }
 
     fn no_mmap(&self) -> bool {
-        self.inner.is_present(NO_MMAP_ARG)
+        self.inner.no_mmap
     }
 
     fn no_names(&self) -> bool {
-        self.inner.is_present(NO_NAMES_ARG)
+        self.inner.no_names
     }
 
-    fn len(&self) -> Result<u64> {
-        if let Some(length) = self.inner.value_of(LENGTH_ARG) {
-            length.parse::<u64>().context("Failed to parse length.")
-        } else {
-            Ok(blake3::OUT_LEN as u64)
-        }
+    fn len(&self) -> u64 {
+        self.inner.length
+    }
+
+    fn seek(&self) -> u64 {
+        self.inner.seek
     }
 
     fn keyed(&self) -> bool {
-        self.inner.is_present(KEYED_ARG)
+        self.inner.keyed
     }
 
     fn quiet(&self) -> bool {
-        self.inner.is_present(QUIET_ARG)
+        self.inner.quiet
     }
 }
 
-enum Input {
-    Mmap(io::Cursor<memmap::Mmap>),
-    File(File),
-    Stdin,
-}
-
-impl Input {
-    // Open an input file, using mmap if appropriate. "-" means stdin. Note
-    // that this convention applies both to command line arguments, and to
-    // filepaths that appear in a checkfile.
-    fn open(path: &Path, args: &Args) -> Result<Self> {
-        if path == Path::new("-") {
-            if args.keyed() {
-                bail!("Cannot open `-` in keyed mode");
-            }
-            return Ok(Self::Stdin);
+fn hash_path(args: &Args, path: &Path) -> anyhow::Result<blake3::OutputReader> {
+    let mut hasher = args.base_hasher.clone();
+    if path == Path::new("-") {
+        if args.keyed() {
+            bail!("Cannot open `-` in keyed mode");
         }
-        let file = File::open(path)?;
-        if !args.no_mmap() {
-            if let Some(mmap) = maybe_memmap_file(&file)? {
-                return Ok(Self::Mmap(io::Cursor::new(mmap)));
-            }
-        }
-        Ok(Self::File(file))
-    }
-
-    fn hash(&mut self, args: &Args) -> Result<blake3::OutputReader> {
-        let mut hasher = args.base_hasher.clone();
-        match self {
-            // The fast path: If we mmapped the file successfully, hash using
-            // multiple threads. This doesn't work on stdin, or on some files,
-            // and it can also be disabled with --no-mmap.
-            Self::Mmap(cursor) => {
-                hasher.update_rayon(cursor.get_ref());
-            }
-            // The slower paths, for stdin or files we didn't/couldn't mmap.
-            // This is currently all single-threaded. Doing multi-threaded
-            // hashing without memory mapping is tricky, since all your worker
-            // threads have to stop every time you refill the buffer, and that
-            // ends up being a lot of overhead. To solve that, we need a more
-            // complicated double-buffering strategy where a background thread
-            // fills one buffer while the worker threads are hashing the other
-            // one. We might implement that in the future, but since this is
-            // the slow path anyway, it's not high priority.
-            Self::File(file) => {
-                copy_wide(file, &mut hasher)?;
-            }
-            Self::Stdin => {
-                let stdin = io::stdin();
-                let lock = stdin.lock();
-                copy_wide(lock, &mut hasher)?;
-            }
-        }
-        Ok(hasher.finalize_xof())
-    }
-}
-
-impl Read for Input {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match self {
-            Self::Mmap(cursor) => cursor.read(buf),
-            Self::File(file) => file.read(buf),
-            Self::Stdin => io::stdin().read(buf),
-        }
-    }
-}
-
-// A 16 KiB buffer is enough to take advantage of all the SIMD instruction sets
-// that we support, but `std::io::copy` currently uses 8 KiB. Most platforms
-// can support at least 64 KiB, and there's some performance benefit to using
-// bigger reads, so that's what we use here.
-fn copy_wide(mut reader: impl Read, hasher: &mut blake3::Hasher) -> io::Result<u64> {
-    let mut buffer = [0; 65536];
-    let mut total = 0;
-    loop {
-        match reader.read(&mut buffer) {
-            Ok(0) => return Ok(total),
-            Ok(n) => {
-                hasher.update(&buffer[..n]);
-                total += n as u64;
-            }
-            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        }
-    }
-}
-
-// Mmap a file, if it looks like a good idea. Return None in cases where we
-// know mmap will fail, or if the file is short enough that mmapping isn't
-// worth it. However, if we do try to mmap and it fails, return the error.
-fn maybe_memmap_file(file: &File) -> Result<Option<memmap::Mmap>> {
-    let metadata = file.metadata()?;
-    let file_size = metadata.len();
-    Ok(if !metadata.is_file() {
-        // Not a real file.
-        None
-    } else if file_size > isize::max_value() as u64 {
-        // Too long to safely map.
-        // https://github.com/danburkert/memmap-rs/issues/69
-        None
-    } else if file_size == 0 {
-        // Mapping an empty file currently fails.
-        // https://github.com/danburkert/memmap-rs/issues/72
-        None
-    } else if file_size < 16 * 1024 {
-        // Mapping small files is not worth it.
-        None
+        hasher.update_reader(io::stdin().lock())?;
+    } else if args.no_mmap() {
+        hasher.update_reader(File::open(path)?)?;
     } else {
-        // Explicitly set the length of the memory map, so that filesystem
-        // changes can't race to violate the invariants we just checked.
-        let map = unsafe {
-            memmap::MmapOptions::new()
-                .len(file_size as usize)
-                .map(&file)?
-        };
-        Some(map)
-    })
+        // The fast path: Try to mmap the file and hash it with multiple threads.
+        hasher.update_mmap_rayon(path)?;
+    }
+    let mut output_reader = hasher.finalize_xof();
+    output_reader.set_position(args.seek());
+    Ok(output_reader)
 }
 
-fn write_hex_output(mut output: blake3::OutputReader, args: &Args) -> Result<()> {
-    // Encoding multiples of the block size is most efficient.
-    let mut len = args.len()?;
-    let mut block = [0; blake3::guts::BLOCK_LEN];
+fn write_hex_output(mut output: blake3::OutputReader, args: &Args) -> anyhow::Result<()> {
+    // Encoding multiples of the 64 bytes is most efficient.
+    // TODO: This computes each output block twice when the --seek argument isn't a multiple of 64.
+    // We'll refactor all of this soon anyway, once SIMD optimizations are available for the XOF.
+    let mut len = args.len();
+    let mut block = [0; blake3::BLOCK_LEN];
     while len > 0 {
         output.fill(&mut block);
         let hex_str = hex::encode(&block[..]);
@@ -319,8 +207,8 @@ fn write_hex_output(mut output: blake3::OutputReader, args: &Args) -> Result<()>
     Ok(())
 }
 
-fn write_raw_output(output: blake3::OutputReader, args: &Args) -> Result<()> {
-    let mut output = output.take(args.len()?);
+fn write_raw_output(output: blake3::OutputReader, args: &Args) -> anyhow::Result<()> {
+    let mut output = output.take(args.len());
     let stdout = std::io::stdout();
     let mut handler = stdout.lock();
     std::io::copy(&mut output, &mut handler)?;
@@ -328,19 +216,19 @@ fn write_raw_output(output: blake3::OutputReader, args: &Args) -> Result<()> {
     Ok(())
 }
 
-fn read_key_from_stdin() -> Result<[u8; blake3::KEY_LEN]> {
+fn read_key_from_stdin() -> anyhow::Result<[u8; blake3::KEY_LEN]> {
     let mut bytes = Vec::with_capacity(blake3::KEY_LEN + 1);
     let n = std::io::stdin()
         .lock()
         .take(blake3::KEY_LEN as u64 + 1)
         .read_to_end(&mut bytes)?;
-    if n < 32 {
+    if n < blake3::KEY_LEN {
         bail!(
             "expected {} key bytes from stdin, found {}",
             blake3::KEY_LEN,
             n,
         )
-    } else if n > 32 {
+    } else if n > blake3::KEY_LEN {
         bail!("read more than {} key bytes from stdin", blake3::KEY_LEN)
     } else {
         Ok(bytes[..blake3::KEY_LEN].try_into().unwrap())
@@ -366,8 +254,11 @@ fn filepath_to_string(filepath: &Path) -> FilepathString {
         filepath_string = filepath_string.replace('\\', "/");
     }
     let mut is_escaped = false;
-    if filepath_string.contains('\\') || filepath_string.contains('\n') {
-        filepath_string = filepath_string.replace('\\', "\\\\").replace('\n', "\\n");
+    if filepath_string.contains(['\\', '\n', '\r']) {
+        filepath_string = filepath_string
+            .replace('\\', "\\\\")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r");
         is_escaped = true;
     }
     FilepathString {
@@ -376,7 +267,7 @@ fn filepath_to_string(filepath: &Path) -> FilepathString {
     }
 }
 
-fn hex_half_byte(c: char) -> Result<u8> {
+fn hex_half_byte(c: char) -> anyhow::Result<u8> {
     // The hex characters in the hash must be lowercase for now, though we
     // could support uppercase too if we wanted to.
     if '0' <= c && c <= '9' {
@@ -393,7 +284,7 @@ fn hex_half_byte(c: char) -> Result<u8> {
 // to ever succeed when it shouldn't (a false positive). By forbidding certain
 // characters in checked filepaths, we avoid a class of false positives where
 // two different filepaths can get confused with each other.
-fn check_for_invalid_characters(utf8_path: &str) -> Result<()> {
+fn check_for_invalid_characters(utf8_path: &str) -> anyhow::Result<()> {
     // Null characters in paths should never happen, but they can result in a
     // path getting silently truncated on Unix.
     if utf8_path.contains('\0') {
@@ -417,7 +308,7 @@ fn check_for_invalid_characters(utf8_path: &str) -> Result<()> {
     Ok(())
 }
 
-fn unescape(mut path: &str) -> Result<String> {
+fn unescape(mut path: &str) -> anyhow::Result<String> {
     let mut unescaped = String::with_capacity(2 * path.len());
     while let Some(i) = path.find('\\') {
         ensure!(i < path.len() - 1, "Invalid backslash escape");
@@ -425,6 +316,7 @@ fn unescape(mut path: &str) -> Result<String> {
         match path[i + 1..].chars().next().unwrap() {
             // Anything other than a recognized escape sequence is an error.
             'n' => unescaped.push_str("\n"),
+            'r' => unescaped.push_str("\r"),
             '\\' => unescaped.push_str("\\"),
             _ => bail!("Invalid backslash escape"),
         }
@@ -442,62 +334,84 @@ struct ParsedCheckLine {
     expected_hash: blake3::Hash,
 }
 
-fn parse_check_line(mut line: &str) -> Result<ParsedCheckLine> {
-    // Trim off the trailing newline, if any.
-    line = line.trim_end_matches('\n');
+fn split_untagged_check_line(line_after_slash: &str) -> Option<(&str, &str)> {
+    // Of the form "<hash>  <file>". The file might contain "  ", so we need to split from the
+    // left.
+    line_after_slash.split_once("  ")
+}
+
+fn split_tagged_check_line(line_after_slash: &str) -> Option<(&str, &str)> {
+    // Of the form "BLAKE3 (<file>) = <hash>". The file might contain ") = ", so we need to split
+    // from the *right*.
+    let prefix = "BLAKE3 (";
+    if !line_after_slash.starts_with(prefix) {
+        return None;
+    }
+    line_after_slash[prefix.len()..].rsplit_once(") = ")
+}
+
+fn parse_check_line(mut line: &str) -> anyhow::Result<ParsedCheckLine> {
+    // Trim off the trailing newlines, if any.
+    line = line.trim_end_matches(['\r', '\n']);
     // If there's a backslash at the front of the line, that means we need to
     // unescape the path below. This matches the behavior of e.g. md5sum.
-    let first = if let Some(c) = line.chars().next() {
-        c
-    } else {
+    let Some(first) = line.chars().next() else {
         bail!("Empty line");
     };
-    let mut is_escaped = false;
+    let line_after_slash;
+    let is_escaped;
     if first == '\\' {
         is_escaped = true;
-        line = &line[1..];
+        line_after_slash = &line[1..];
+    } else {
+        is_escaped = false;
+        line_after_slash = line;
     }
-    // The front of the line must be a hash of the usual length, followed by
-    // two spaces. The hex characters in the hash must be lowercase for now,
-    // though we could support uppercase too if we wanted to.
-    let hash_hex_len = 2 * blake3::OUT_LEN;
-    let num_spaces = 2;
-    let prefix_len = hash_hex_len + num_spaces;
-    ensure!(line.len() > prefix_len, "Short line");
-    ensure!(
-        line.chars().take(prefix_len).all(|c| c.is_ascii()),
-        "Non-ASCII prefix"
-    );
-    ensure!(&line[hash_hex_len..][..2] == "  ", "Invalid space");
-    // Decode the hash hex.
+
+    // Split the line. It might be "<hash>  <file>" or "BLAKE3 (<file>) = <hash>". The latter comes
+    // from the --tag flag.
+    let hash_hex;
+    let file_str;
+    if let Some((left, right)) = split_untagged_check_line(line_after_slash) {
+        hash_hex = left;
+        file_str = right;
+    } else if let Some((left, right)) = split_tagged_check_line(line_after_slash) {
+        file_str = left;
+        hash_hex = right;
+    } else {
+        bail!("Invalid check line format");
+    }
+
+    // Decode the hex hash.
+    ensure!(hash_hex.len() == 2 * blake3::OUT_LEN, "Invalid hash length");
+    let mut hex_chars = hash_hex.chars();
     let mut hash_bytes = [0; blake3::OUT_LEN];
-    let mut hex_chars = line[..hash_hex_len].chars();
     for byte in &mut hash_bytes {
         let high_char = hex_chars.next().unwrap();
         let low_char = hex_chars.next().unwrap();
         *byte = 16 * hex_half_byte(high_char)? + hex_half_byte(low_char)?;
     }
     let expected_hash: blake3::Hash = hash_bytes.into();
-    let file_string = line[prefix_len..].to_string();
+
+    // Unescape and validate the filepath.
     let file_path_string = if is_escaped {
-        // If we detected a backslash at the start of the line earlier, now we
-        // need to unescape backslashes and newlines.
-        unescape(&file_string)?
+        unescape(file_str)?
     } else {
-        file_string.clone().into()
+        file_str.to_string()
     };
+    ensure!(!file_path_string.is_empty(), "empty file path");
     check_for_invalid_characters(&file_path_string)?;
+
     Ok(ParsedCheckLine {
-        file_string,
+        file_string: file_str.to_string(),
         is_escaped,
         file_path: file_path_string.into(),
         expected_hash,
     })
 }
 
-fn hash_one_input(path: &Path, args: &Args) -> Result<()> {
-    let mut input = Input::open(path, args)?;
-    let output = input.hash(args)?;
+fn hash_one_input(path: &Path, args: &Args) -> anyhow::Result<()> {
+    let output = hash_path(args, path)?;
     if args.raw() {
         write_raw_output(output, args)?;
         return Ok(());
@@ -514,14 +428,20 @@ fn hash_one_input(path: &Path, args: &Args) -> Result<()> {
     if is_escaped {
         print!("\\");
     }
+    if args.tag() {
+        print!("BLAKE3 ({}) = ", filepath_string);
+        write_hex_output(output, args)?;
+        println!();
+        return Ok(());
+    }
     write_hex_output(output, args)?;
     println!("  {}", filepath_string);
     Ok(())
 }
 
 // Returns true for success. Having a boolean return value here, instead of
-// passing down the some_file_failed reference, makes it less likely that we
-// might forget to set it in some error condition.
+// passing down the files_failed reference, makes it less likely that we might
+// forget to set it in some error condition.
 fn check_one_line(line: &str, args: &Args) -> bool {
     let parse_result = parse_check_line(&line);
     let ParsedCheckLine {
@@ -541,15 +461,13 @@ fn check_one_line(line: &str, args: &Args) -> bool {
     } else {
         file_string
     };
-    let hash_result: Result<blake3::Hash> = Input::open(&file_path, args)
-        .and_then(|mut input| input.hash(args))
-        .map(|mut hash_output| {
+    let found_hash: blake3::Hash;
+    match hash_path(args, &file_path) {
+        Ok(mut output) => {
             let mut found_hash_bytes = [0; blake3::OUT_LEN];
-            hash_output.fill(&mut found_hash_bytes);
-            found_hash_bytes.into()
-        });
-    let found_hash: blake3::Hash = match hash_result {
-        Ok(hash) => hash,
+            output.fill(&mut found_hash_bytes);
+            found_hash = found_hash_bytes.into();
+        }
         Err(e) => {
             println!("{}: FAILED ({})", file_string, e);
             return false;
@@ -567,9 +485,19 @@ fn check_one_line(line: &str, args: &Args) -> bool {
     }
 }
 
-fn check_one_checkfile(path: &Path, args: &Args, some_file_failed: &mut bool) -> Result<()> {
-    let checkfile_input = Input::open(path, args)?;
-    let mut bufreader = io::BufReader::new(checkfile_input);
+fn check_one_checkfile(path: &Path, args: &Args, files_failed: &mut u64) -> anyhow::Result<()> {
+    let mut file;
+    let stdin;
+    let mut stdin_lock;
+    let mut bufreader: io::BufReader<&mut dyn Read>;
+    if path == Path::new("-") {
+        stdin = io::stdin();
+        stdin_lock = stdin.lock();
+        bufreader = io::BufReader::new(&mut stdin_lock);
+    } else {
+        file = File::open(path)?;
+        bufreader = io::BufReader::new(&mut file);
+    }
     let mut line = String::new();
     loop {
         line.clear();
@@ -581,29 +509,26 @@ fn check_one_checkfile(path: &Path, args: &Args, some_file_failed: &mut bool) ->
         // return, so it doesn't return a Result.
         let success = check_one_line(&line, args);
         if !success {
-            *some_file_failed = true;
+            // We use `files_failed > 0` to indicate a mismatch, so it's important for correctness
+            // that it's impossible for this counter to overflow.
+            *files_failed = files_failed.saturating_add(1);
         }
     }
 }
 
-fn main() -> Result<()> {
+fn main() -> anyhow::Result<()> {
     let args = Args::parse()?;
-    let mut thread_pool_builder = rayon::ThreadPoolBuilder::new();
-    if let Some(num_threads) = args.num_threads()? {
+    let mut thread_pool_builder = rayon_core::ThreadPoolBuilder::new();
+    if let Some(num_threads) = args.num_threads() {
         thread_pool_builder = thread_pool_builder.num_threads(num_threads);
     }
     let thread_pool = thread_pool_builder.build()?;
     thread_pool.install(|| {
-        let mut some_file_failed = false;
+        let mut files_failed = 0u64;
         // Note that file_args automatically includes `-` if nothing is given.
         for path in &args.file_args {
             if args.check() {
-                // A hash mismatch or a failure to read a hashed file will be
-                // printed in the checkfile loop, and will not propagate here.
-                // This is similar to the explicit error handling we do in the
-                // hashing case immediately below. In these cases,
-                // some_file_failed will be set to false.
-                check_one_checkfile(path, &args, &mut some_file_failed)?;
+                check_one_checkfile(path, &args, &mut files_failed)?;
             } else {
                 // Errors encountered in hashing are tolerated and printed to
                 // stderr. This allows e.g. `b3sum *` to print errors for
@@ -611,11 +536,29 @@ fn main() -> Result<()> {
                 // errors we'll still return non-zero at the end.
                 let result = hash_one_input(path, &args);
                 if let Err(e) = result {
-                    some_file_failed = true;
+                    files_failed = files_failed.saturating_add(1);
                     eprintln!("{}: {}: {}", NAME, path.to_string_lossy(), e);
                 }
             }
         }
-        std::process::exit(if some_file_failed { 1 } else { 0 });
+        if args.check() && files_failed > 0 {
+            eprintln!(
+                "{}: WARNING: {} computed checksum{} did NOT match",
+                NAME,
+                files_failed,
+                if files_failed == 1 { "" } else { "s" },
+            );
+        }
+        std::process::exit(if files_failed > 0 { 1 } else { 0 });
     })
+}
+
+#[cfg(test)]
+mod test {
+    use clap::CommandFactory;
+
+    #[test]
+    fn test_args() {
+        crate::Inner::command().debug_assert();
+    }
 }

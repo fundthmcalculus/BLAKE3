@@ -1,5 +1,9 @@
-use blake3::guts::{BLOCK_LEN, CHUNK_LEN};
+use blake3::{BLOCK_LEN, CHUNK_LEN};
 use serde::{Deserialize, Serialize};
+
+// Reading files at runtime requires special configuration under WASM/WASI, so including this at
+// compile time is simpler.
+const TEST_VECTORS_JSON: &str = include_str!("../test_vectors.json");
 
 // A non-multiple of 4 is important, since one possible bug is to fail to emit
 // partial words.
@@ -59,7 +63,7 @@ also check that the first 32 bytes match their default-length output.
 "#;
 
 // Paint the input with a repeating byte pattern. We use a cycle length of 251,
-// because that's the largets prime number less than 256. This makes it
+// because that's the largest prime number less than 256. This makes it
 // unlikely to swapping any two adjacent input blocks or chunks will give the
 // same answer.
 pub fn paint_test_input(buf: &mut [u8]) {
@@ -129,20 +133,13 @@ pub fn generate_json() -> String {
     json
 }
 
-pub fn read_test_vectors_file() -> String {
-    let test_vectors_file_path = "./test_vectors.json";
-    std::fs::read_to_string(test_vectors_file_path).expect("failed to read test_vectors.json")
-}
-
 pub fn parse_test_cases() -> Cases {
-    let json = read_test_vectors_file();
-    serde_json::from_str(&json).expect("failed to parse test_vectors.json")
+    serde_json::from_str(TEST_VECTORS_JSON).expect("failed to parse test_vectors.json")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::convert::TryInto;
 
     fn test_reference_impl_all_at_once(
         key: &[u8; blake3::KEY_LEN],
@@ -345,7 +342,7 @@ mod tests {
     fn test_checked_in_vectors_up_to_date() {
         // Replace Windows newlines, in case Git is configured to alter
         // newlines when files are checked out.
-        let json = read_test_vectors_file().replace("\r\n", "\n");
+        let json = TEST_VECTORS_JSON.replace("\r\n", "\n");
         if generate_json() != json {
             panic!("Checked-in test_vectors.json is not up to date. Regenerate with `cargo run --bin generate > ./test_vectors.json`.");
         }
